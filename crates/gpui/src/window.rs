@@ -1103,6 +1103,7 @@ pub struct Window {
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
+    zoom: f32,
     pub(crate) bounds_observers: SubscriberSet<(), AnyObserver>,
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
@@ -1289,6 +1290,10 @@ pub(crate) struct ElementStateBox {
     pub(crate) inner: Box<dyn Any>,
     #[cfg(debug_assertions)]
     pub(crate) type_name: &'static str,
+}
+
+pub(crate) fn scale_bounds(bounds: Bounds<Pixels>, factor: f32) -> Bounds<Pixels> {
+    bounds.map(|length| length * factor)
 }
 
 fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
@@ -1823,6 +1828,7 @@ impl Window {
             modifiers,
             capslock,
             scale_factor,
+            zoom: 1.0,
             bounds_observers: SubscriberSet::new(),
             appearance,
             appearance_observers: SubscriberSet::new(),
@@ -2113,7 +2119,13 @@ impl Window {
     /// - `Some(&[])` is an empty region, so the window receives no pointer or touch input.
     /// - `None` resets the region to the default, so the whole window receives input again.
     pub fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
-        self.platform_window.set_input_region(region);
+        let scaled = region.map(|rects| {
+            rects
+                .iter()
+                .map(|rect| scale_bounds(*rect, self.zoom))
+                .collect::<Vec<_>>()
+        });
+        self.platform_window.set_input_region(scaled.as_deref());
     }
 
     /// Return the `WindowBounds` to indicate that how a window should be opened
@@ -2375,10 +2387,14 @@ impl Window {
     /// the platform window, then notifies observers. Normally called automatically
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
-        self.scale_factor = self.platform_window.scale_factor();
-        self.viewport_size = self.platform_window.content_size();
+        let inverse_zoom = 1.0 / self.zoom;
+        self.scale_factor = self.platform_window.scale_factor() * self.zoom;
+        self.viewport_size = self
+            .platform_window
+            .content_size()
+            .map(|length| length * inverse_zoom);
         self.display_id = self.platform_window.display().map(|display| display.id());
-        self.mouse_position = self.platform_window.mouse_position();
+        self.mouse_position = self.platform_window.mouse_position() * inverse_zoom;
 
         self.refresh();
 
@@ -2462,7 +2478,7 @@ impl Window {
 
     /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
     pub fn show_window_menu(&self, position: Point<Pixels>) {
-        self.platform_window.show_window_menu(position)
+        self.platform_window.show_window_menu(position * self.zoom)
     }
 
     /// Handle window movement for Linux and macOS.
@@ -2476,7 +2492,7 @@ impl Window {
     /// When using client side decorations, set this to the width of the invisible decorations (Wayland and X11)
     pub fn set_client_inset(&mut self, inset: Pixels) {
         self.client_inset = Some(inset);
-        self.platform_window.set_client_inset(inset);
+        self.platform_window.set_client_inset(inset * self.zoom);
     }
 
     /// Returns the client_inset value by [`Self::set_client_inset`].
@@ -2546,6 +2562,24 @@ impl Window {
     /// be rendered as two pixels on screen.
     pub fn scale_factor(&self) -> f32 {
         self.scale_factor
+    }
+
+    /// The application-controlled zoom applied on top of the display scale factor.
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    /// Scales everything drawn in the window, like zooming a web page. Layout sees a
+    /// viewport shrunk by the same factor, so `Pixels` keep their meaning for elements.
+    pub fn set_zoom(&mut self, zoom: f32, cx: &mut App) {
+        if !zoom.is_finite() || zoom <= 0.0 || zoom == self.zoom {
+            return;
+        }
+        self.zoom = zoom;
+        if let Some(inset) = self.client_inset {
+            self.platform_window.set_client_inset(inset * zoom);
+        }
+        self.bounds_changed(cx);
     }
 
     /// The size of an em for the base font of the application. Adjusting this value allows the
@@ -5170,6 +5204,38 @@ impl Window {
             .unwrap_or_else(|| action.name().to_string())
     }
 
+    fn unzoom_input(&self, mut event: PlatformInput) -> PlatformInput {
+        if self.zoom == 1.0 {
+            return event;
+        }
+        let inverse_zoom = 1.0 / self.zoom;
+        match &mut event {
+            PlatformInput::MouseDown(event) => event.position *= inverse_zoom,
+            PlatformInput::MouseUp(event) => event.position *= inverse_zoom,
+            PlatformInput::MouseMove(event) => event.position *= inverse_zoom,
+            PlatformInput::MousePressure(event) => event.position *= inverse_zoom,
+            PlatformInput::MouseExited(event) => event.position *= inverse_zoom,
+            PlatformInput::Pinch(event) => event.position *= inverse_zoom,
+            PlatformInput::Touch(event) => event.position *= inverse_zoom,
+            PlatformInput::ScrollWheel(event) => {
+                event.position *= inverse_zoom;
+                if let crate::ScrollDelta::Pixels(delta) = &mut event.delta {
+                    *delta *= inverse_zoom;
+                }
+            }
+            PlatformInput::FileDrop(
+                FileDropEvent::Entered { position, .. }
+                | FileDropEvent::Pending { position }
+                | FileDropEvent::Submit { position },
+            ) => *position *= inverse_zoom,
+            PlatformInput::FileDrop(FileDropEvent::Exited)
+            | PlatformInput::KeyDown(_)
+            | PlatformInput::KeyUp(_)
+            | PlatformInput::ModifiersChanged(_) => {}
+        }
+        event
+    }
+
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
@@ -5195,6 +5261,7 @@ impl Window {
         // Handlers may set this to true by calling `prevent_default`.
         self.default_prevented = false;
 
+        let event = self.unzoom_input(event);
         let event = match event {
             // Track the mouse position with our own state, since accessing the platform
             // API for the mouse position can only occur on the main thread.
@@ -5839,7 +5906,9 @@ impl Window {
         self.on_next_frame(|window, cx| {
             if let Some(mut input_handler) = window.platform_window.take_input_handler() {
                 if let Some(bounds) = input_handler.selected_bounds(window, cx) {
-                    window.platform_window.update_ime_position(bounds);
+                    window
+                        .platform_window
+                        .update_ime_position(scale_bounds(bounds, window.zoom));
                 }
                 window.platform_window.set_input_handler(input_handler);
             }
